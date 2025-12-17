@@ -210,7 +210,6 @@ async def run_bot(
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
-        browser_for_wait = None
         if profile_dir:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
@@ -218,11 +217,9 @@ async def run_bot(
                 slow_mo=slowmo_ms,
                 viewport={"width": 1100, "height": 900},
             )
-            browser_for_wait = context.browser
             page = context.pages[0] if context.pages else await context.new_page()
         else:
             browser = await p.chromium.launch(headless=not headful, slow_mo=slowmo_ms)
-            browser_for_wait = browser
             context = await browser.new_context(viewport={"width": 1100, "height": 900})
             page = await context.new_page()
         page.set_default_timeout(3000)
@@ -321,14 +318,16 @@ async def run_bot(
             print("---- end history ----")
         if leave_open and headful:
             print("Leaving browser open. Close the browser window to exit.")
-            if browser_for_wait is not None:
+            # Wait until the user closes the window; Ctrl+C should exit cleanly.
+            try:
+                await page.wait_for_event("close")
+            except asyncio.CancelledError:
+                return
+            except Exception:
                 try:
-                    await browser_for_wait.wait_for_event("disconnected")
-                except Exception:
                     await asyncio.Event().wait()
-            else:
-                await asyncio.Event().wait()
-            return
+                except asyncio.CancelledError:
+                    return
 
         await context.close()
         if not profile_dir:
@@ -388,21 +387,25 @@ def main() -> None:
     # Default behavior: in headful mode, keep the browser open after finishing.
     # Use --close to force shutdown (useful for automation).
     leave_open = args.headful and not args.close
-    asyncio.run(
-        run_bot(
-            url=url,
-            width=width,
-            height=height,
-            total_mines=mines,
-            headful=args.headful,
-            leave_open=leave_open,
-            slowmo_ms=args.slowmo_ms,
-            think_ms=args.think_ms,
-            max_steps=args.max_steps,
-            profile_dir=profile_dir,
-            stuck_threshold=args.stuck_threshold,
+    try:
+        asyncio.run(
+            run_bot(
+                url=url,
+                width=width,
+                height=height,
+                total_mines=mines,
+                headful=args.headful,
+                leave_open=leave_open,
+                slowmo_ms=args.slowmo_ms,
+                think_ms=args.think_ms,
+                max_steps=args.max_steps,
+                profile_dir=profile_dir,
+                stuck_threshold=args.stuck_threshold,
+            )
         )
-    )
+    except KeyboardInterrupt:
+        # Exit quietly on Ctrl+C (do not print a full traceback).
+        return
 
 
 if __name__ == "__main__":
