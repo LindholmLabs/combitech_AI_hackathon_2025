@@ -26,7 +26,6 @@ _COOKIE_BUTTON_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _parse_cell_id(cell_id: str) -> Cell | None:
     if not cell_id:
         return None
@@ -35,24 +34,41 @@ def _parse_cell_id(cell_id: str) -> Cell | None:
         return None
     return Cell(int(m.group(1)), int(m.group(2)))
 
-
-async def read_board(page: "Page", width: int, height: int) -> BoardSnapshot:
-    data: list[dict[str, Any]] = await page.evaluate(
+async def detect_board_origin(page: "Page") -> tuple[int, int]:
+    data: dict[str, Any] = await page.evaluate(
         """
-        () => Array.from(document.querySelectorAll('div.square[id]'))
-          .map(e => {
-            const r = e.getBoundingClientRect();
-            const s = window.getComputedStyle(e);
-            const visible =
-              r.width > 0 && r.height > 0 &&
-              r.bottom > 0 && r.right > 0 &&
-              r.top < window.innerHeight && r.left < window.innerWidth &&
-              s && s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
-            return { id: e.id, className: e.className || '', visible };
-          })
-          .filter(x => x.visible)
+        () => {
+          if (document.getElementById('1_1')) return { ox: 1, oy: 1 };
+          if (document.getElementById('0_0')) return { ox: 0, oy: 0 };
+          const any = document.querySelector('div.square[id]');
+          if (!any || !any.id) return { ox: 0, oy: 0 };
+          const m = /^(\\d+)_(\\d+)$/.exec(any.id);
+          if (!m) return { ox: 0, oy: 0 };
+          return { ox: parseInt(m[1], 10), oy: parseInt(m[2], 10) };
+        }
         """
     )
+    return int(data.get("ox", 0)), int(data.get("oy", 0))
+
+
+async def read_board(page: "Page", origin_x: int, origin_y: int, width: int, height: int) -> BoardSnapshot:
+    raw: list[list[str]] = await page.evaluate(
+        """
+        ({ox, oy, w, h}) => {
+          const out = [];
+          for (let y = oy; y < oy + h; y++) {
+            for (let x = ox; x < ox + w; x++) {
+              const id = `${x}_${y}`;
+              const e = document.getElementById(id);
+              out.push([id, e ? (e.className || '') : '']);
+            }
+          }
+          return out;
+        }
+        """,
+        {"ox": origin_x, "oy": origin_y, "w": width, "h": height},
+    )
+    data: list[dict[str, Any]] = [{"id": pair[0], "className": pair[1]} for pair in raw]
     cells: dict[Cell, object] = {}
     coords: list[Cell] = []
     for item in data:
@@ -62,42 +78,55 @@ async def read_board(page: "Page", width: int, height: int) -> BoardSnapshot:
         coords.append(c)
         cells[c] = parse_square_class(item.get("className", ""))
 
-    if coords:
-        origin_x = min(c.x for c in coords)
-        origin_y = min(c.y for c in coords)
-        inferred_w = max(c.x for c in coords) - origin_x + 1
-        inferred_h = max(c.y for c in coords) - origin_y + 1
-    else:
-        origin_x = 0
-        origin_y = 0
-        inferred_w = 0
-        inferred_h = 0
-
-    # Prefer the size inferred from *visible* squares. Passing --width/--height is
-    # still useful for mine counts / difficulty presets, but DOM may contain
-    # hidden "square" nodes (ads/templates) with out-of-range ids.
-    board_w = inferred_w if inferred_w > 0 else width
-    board_h = inferred_h if inferred_h > 0 else height
-    if board_w <= 0 or board_h <= 0:
-        board_w, board_h = (width or 9), (height or 9)
-
-    # Fill missing entries as covered. DOM can omit elements briefly during transitions.
-    for y in range(origin_y, origin_y + board_h):
-        for x in range(origin_x, origin_x + board_w):
+    for y in range(origin_y, origin_y + height):
+        for x in range(origin_x, origin_x + width):
             cells.setdefault(Cell(x, y), "covered")
 
-    return BoardSnapshot(origin_x=origin_x, origin_y=origin_y, width=board_w, height=board_h, cells=cells)
+    return BoardSnapshot(origin_x=origin_x, origin_y=origin_y, width=width, height=height, cells=cells)
 
 
 async def game_state(page: "Page") -> str:
-    # minesweeperonline uses #face with classes like facesmile/facewin/facedead.
-    face = await page.locator("#face").get_attribute("class")
+    # Avoid Playwright auto-wait (which can add multi-second pauses); read directly.
+    face = await page.evaluate("() => document.getElementById('face')?.className || ''")
     face = face or ""
     if "facewin" in face:
         return "win"
     if "facedead" in face:
         return "dead"
     return "playing"
+
+async def _dispatch_actions(page: "Page", actions: list[dict[str, Any]]) -> int:
+    # Faster than N separate Playwright clicks; also bypasses strict actionability checks.
+    return await page.evaluate(
+        """
+        (actions) => {
+          let done = 0;
+          for (const a of actions) {
+            const id = a.id;
+            const buttonName = a.button;
+            const e = document.getElementById(id);
+            if (!e) continue;
+            const isRight = buttonName === 'right';
+            const button = isRight ? 2 : 0;
+            const buttons = isRight ? 2 : 1;
+            const common = {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: window,
+              button,
+              buttons
+            };
+            e.dispatchEvent(new MouseEvent('mousedown', common));
+            e.dispatchEvent(new MouseEvent('mouseup', common));
+            e.dispatchEvent(new MouseEvent(isRight ? 'contextmenu' : 'click', common));
+            done += 1;
+          }
+          return done;
+        }
+        """,
+        actions,
+    )
 
 async def _dismiss_common_popups(page: "Page") -> None:
     # Cookie/consent banners vary by region and provider (Quantcast/OneTrust/etc).
@@ -158,40 +187,21 @@ async def _dismiss_common_popups(page: "Page") -> None:
 
 
 async def click_cell(page: "Page", cell: Cell, button: str = "left") -> None:
-    # IDs like "5_5" start with a digit which is not a valid CSS id selector
-    # without escaping; use an attribute selector instead.
-    locator = page.locator(f'div.square[id="{cell.x}_{cell.y}"]')
-
-    async def pick_visible(loc: Any) -> Any:
-        try:
-            count = await loc.count()
-        except Exception:
-            return loc.first
-        for i in range(count):
-            item = loc.nth(i)
-            try:
-                if await item.is_visible(timeout=100):
-                    return item
-            except Exception:
-                continue
-        return loc.first
-
-    locator = await pick_visible(locator)
+    cell_id = f"{cell.x}_{cell.y}"
     try:
-        await locator.scroll_into_view_if_needed(timeout=3000)
+        done = await _dispatch_actions(page, [{"id": cell_id, "button": button}])
+        if done:
+            return
+    except Exception:
+        pass
+
+    locator = page.locator(f'div.square[id="{cell_id}"]').first
+    try:
         await locator.click(button=button, timeout=3000)
     except Exception:
         # Often a cookie banner blocks the first action; dismiss and retry once.
         await _dismiss_common_popups(page)
-        try:
-            await locator.scroll_into_view_if_needed(timeout=3000)
-        except Exception:
-            pass
-        try:
-            await locator.click(button=button, timeout=3000)
-        except Exception:
-            # Last resort: bypass actionability checks (helpful for overlays/animations).
-            await locator.click(button=button, timeout=3000, force=True)
+        await locator.click(button=button, timeout=3000, force=True)
 
 
 async def run_bot(
@@ -230,6 +240,7 @@ async def run_bot(
         await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_timeout(500)
         await _dismiss_common_popups(page)
+        origin_x, origin_y = await detect_board_origin(page)
 
         steps = 0
         same_state_steps = 0
@@ -249,7 +260,7 @@ async def run_bot(
             if state != "playing":
                 break
 
-            board = await read_board(page, width=width, height=height)
+            board = await read_board(page, origin_x=origin_x, origin_y=origin_y, width=width, height=height)
             opened_sig = tuple(
                 sorted(
                     (c.x, c.y, v)
@@ -275,14 +286,26 @@ async def run_bot(
 
             res = solve_step(board, total_mines=total_mines)
             if res.to_flag or res.to_click:
-                for c in iter_in_order(res.to_flag):
-                    if board.get(c) == "covered":
-                        await click_cell(page, c, button="right")
-                        await record_and_wait(f"flag {fmt_cell(c)}")
-                for c in iter_in_order(res.to_click):
-                    if board.get(c) == "covered":
-                        await click_cell(page, c, button="left")
-                        await record_and_wait(f"click {fmt_cell(c)}")
+                flags = [c for c in iter_in_order(res.to_flag) if board.get(c) == "covered"]
+                clicks = [c for c in iter_in_order(res.to_click) if board.get(c) == "covered"]
+
+                if flags:
+                    await _dispatch_actions(
+                        page,
+                        [{"id": f"{c.x}_{c.y}", "button": "right"} for c in flags],
+                    )
+                    for c in flags:
+                        history.append(f"{steps:04d} flag {fmt_cell(c)}")
+
+                if clicks:
+                    await _dispatch_actions(
+                        page,
+                        [{"id": f"{c.x}_{c.y}", "button": "left"} for c in clicks],
+                    )
+                    for c in clicks:
+                        history.append(f"{steps:04d} click {fmt_cell(c)}")
+
+                await page.wait_for_timeout(think_ms)
                 continue
 
             if res.guess:
@@ -318,7 +341,9 @@ async def run_bot(
             print("---- end history ----")
         if state == "dead":
             try:
-                final_board = await read_board(page, width=width, height=height)
+                final_board = await read_board(
+                    page, origin_x=origin_x, origin_y=origin_y, width=width, height=height
+                )
                 print("---- final board ----")
                 print(render_board_for_llm(final_board))
                 print("---- end final board ----")

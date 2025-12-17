@@ -17,3 +17,4 @@ Notes:
 - Board detection: the bot only uses *visible* `.square` elements to avoid hidden template/ad elements with `square` classes and out-of-range ids.
 - Browser lifecycle: in `--headful` mode, the bot leaves the browser open after the game ends (close it manually). Use `--close` to force it to exit.
 - Flag safety: before placing multiple flags, the bot filters them to avoid over-flagging around any revealed number (e.g. never places 2 flags adjacent to a `1`).
+- Performance: within a step, clicks/flags are batched and dispatched in-page (reduces Playwright round-trips); `read_board()` also reads the full board in a single `page.evaluate()` by iterating expected `x_y` ids (no repeated DOM scanning).
