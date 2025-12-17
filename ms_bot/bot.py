@@ -13,6 +13,13 @@ from .solver import best_guess, choose_first_click, iter_in_order, solve_step
 
 
 DEFAULT_URL = "https://minesweeperonline.com/#beginner"
+BASE_URL = "https://minesweeperonline.com/"
+
+DIFFICULTY_PRESETS: dict[str, dict[str, object]] = {
+    "beginner": {"fragment": "beginner", "width": 9, "height": 9, "mines": 10},
+    "intermediate": {"fragment": "intermediate", "width": 16, "height": 16, "mines": 40},
+    "expert": {"fragment": "expert", "width": 16, "height": 30, "mines": 99},
+}
 
 _COOKIE_BUTTON_RE = re.compile(
     r"^(accept|accept all|agree|i agree|ok|okay|got it|consent|allow all)$",
@@ -198,10 +205,12 @@ async def run_bot(
     max_steps: int,
     profile_dir: str | None,
     stuck_threshold: int,
+    leave_open: bool,
 ) -> None:
     from playwright.async_api import async_playwright
 
     async with async_playwright() as p:
+        browser_for_wait = None
         if profile_dir:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
@@ -209,9 +218,11 @@ async def run_bot(
                 slow_mo=slowmo_ms,
                 viewport={"width": 1100, "height": 900},
             )
+            browser_for_wait = context.browser
             page = context.pages[0] if context.pages else await context.new_page()
         else:
             browser = await p.chromium.launch(headless=not headful, slow_mo=slowmo_ms)
+            browser_for_wait = browser
             context = await browser.new_context(viewport={"width": 1100, "height": 900})
             page = await context.new_page()
         page.set_default_timeout(3000)
@@ -292,8 +303,17 @@ async def run_bot(
         await page.wait_for_timeout(500)
         state = await game_state(page)
         print(f"Finished after {steps} steps: {state}")
-        if headful:
-            await page.wait_for_timeout(10_000)
+        if leave_open and headful:
+            print("Leaving browser open. Close the browser window to exit.")
+            if browser_for_wait is not None:
+                try:
+                    await browser_for_wait.wait_for_event("disconnected")
+                except Exception:
+                    await asyncio.Event().wait()
+            else:
+                await asyncio.Event().wait()
+            return
+
         await context.close()
         if not profile_dir:
             await browser.close()
@@ -301,11 +321,25 @@ async def run_bot(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Play minesweeperonline.com using heuristics.")
-    ap.add_argument("--url", default=DEFAULT_URL)
-    ap.add_argument("--width", type=int, default=9)
-    ap.add_argument("--height", type=int, default=9)
-    ap.add_argument("--mines", type=int, default=10)
+    diff = ap.add_mutually_exclusive_group()
+    diff.add_argument("--beginner", action="store_true", help="Play beginner (default).")
+    diff.add_argument("--intermediate", action="store_true", help="Play intermediate.")
+    diff.add_argument("--expert", action="store_true", help="Play expert.")
+    ap.add_argument("--url", default=None, help="Override game URL (defaults to chosen difficulty).")
+    ap.add_argument("--width", type=int, default=None, help="Override inferred/preset width.")
+    ap.add_argument("--height", type=int, default=None, help="Override inferred/preset height.")
+    ap.add_argument("--mines", type=int, default=None, help="Override preset mine count.")
     ap.add_argument("--headful", action="store_true")
+    ap.add_argument(
+        "--leave-open",
+        action="store_true",
+        help="After finishing, leave the browser open (headful only).",
+    )
+    ap.add_argument(
+        "--close",
+        action="store_true",
+        help="Force closing the browser after finishing (overrides --leave-open).",
+    )
     ap.add_argument("--slowmo-ms", type=int, default=0)
     ap.add_argument("--think-ms", type=int, default=30)
     ap.add_argument("--max-steps", type=int, default=5000)
@@ -321,14 +355,31 @@ def main() -> None:
         help="Chromium user data dir for persistent cookies/storage; set to empty to disable.",
     )
     args = ap.parse_args()
+
+    difficulty = "beginner"
+    if args.intermediate:
+        difficulty = "intermediate"
+    elif args.expert:
+        difficulty = "expert"
+
+    preset = DIFFICULTY_PRESETS[difficulty]
+    url = args.url or f"{BASE_URL}#{preset['fragment']}"
+    width = args.width if args.width is not None else int(preset["width"])
+    height = args.height if args.height is not None else int(preset["height"])
+    mines = args.mines if args.mines is not None else int(preset["mines"])
+
     profile_dir = args.profile_dir if str(args.profile_dir).strip() else None
+    # Default behavior: in headful mode, keep the browser open after finishing.
+    # Use --close to force shutdown (useful for automation).
+    leave_open = args.headful and not args.close
     asyncio.run(
         run_bot(
-            url=args.url,
-            width=args.width,
-            height=args.height,
-            total_mines=args.mines,
+            url=url,
+            width=width,
+            height=height,
+            total_mines=mines,
             headful=args.headful,
+            leave_open=leave_open,
             slowmo_ms=args.slowmo_ms,
             think_ms=args.think_ms,
             max_steps=args.max_steps,
