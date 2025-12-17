@@ -237,6 +237,15 @@ async def run_bot(
         steps = 0
         same_state_steps = 0
         last_sig: tuple[tuple[tuple[int, int, int], ...], tuple[tuple[int, int], ...]] | None = None
+        history: list[str] = []
+
+        def fmt_cell(c: Cell) -> str:
+            return f"{c.x}_{c.y}"
+
+        async def record_and_wait(note: str) -> None:
+            history.append(f"{steps:04d} {note}")
+            await page.wait_for_timeout(think_ms)
+
         while steps < max_steps:
             steps += 1
             state = await game_state(page)
@@ -264,7 +273,7 @@ async def run_bot(
             if not opened:
                 first = choose_first_click(board)
                 await click_cell(page, first, button="left")
-                await page.wait_for_timeout(think_ms)
+                await record_and_wait(f"first_click {fmt_cell(first)}")
                 continue
 
             res = solve_step(board, total_mines=total_mines)
@@ -272,16 +281,17 @@ async def run_bot(
                 for c in iter_in_order(res.to_flag):
                     if board.get(c) == "covered":
                         await click_cell(page, c, button="right")
-                        await page.wait_for_timeout(think_ms)
+                        await record_and_wait(f"flag {fmt_cell(c)}")
                 for c in iter_in_order(res.to_click):
                     if board.get(c) == "covered":
                         await click_cell(page, c, button="left")
-                        await page.wait_for_timeout(think_ms)
+                        await record_and_wait(f"click {fmt_cell(c)}")
                 continue
 
             if res.guess:
                 await click_cell(page, res.guess, button="left")
-                await page.wait_for_timeout(think_ms)
+                p = "?" if res.guess_prob is None else f"{res.guess_prob:.3f}"
+                await record_and_wait(f"guess {fmt_cell(res.guess)} p={p}")
                 continue
 
             # If we observe no board changes for several iterations, force a guess.
@@ -289,7 +299,8 @@ async def run_bot(
                 guess, _prob = best_guess(board, total_mines=total_mines)
                 if guess:
                     await click_cell(page, guess, button="left")
-                    await page.wait_for_timeout(think_ms)
+                    p = "?" if _prob is None else f"{_prob:.3f}"
+                    await record_and_wait(f"stuck_guess {fmt_cell(guess)} p={p}")
                     same_state_steps = 0
                     continue
 
@@ -298,11 +309,16 @@ async def run_bot(
             if not covered:
                 break
             await click_cell(page, covered[0], button="left")
-            await page.wait_for_timeout(think_ms)
+            await record_and_wait(f"fallback_click {fmt_cell(covered[0])}")
 
         await page.wait_for_timeout(500)
         state = await game_state(page)
         print(f"Finished after {steps} steps: {state}")
+        if state in ("dead", "win"):
+            print("---- move history ----")
+            for line in history:
+                print(line)
+            print("---- end history ----")
         if leave_open and headful:
             print("Leaving browser open. Close the browser window to exit.")
             if browser_for_wait is not None:

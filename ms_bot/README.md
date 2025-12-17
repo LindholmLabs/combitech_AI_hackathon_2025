@@ -16,3 +16,4 @@ Notes:
 - Stuck guessing: if the board state doesn't change for a few loops, the bot forces a guess (`--stuck-threshold 5`, disable with `--stuck-threshold 0`).
 - Board detection: the bot only uses *visible* `.square` elements to avoid hidden template/ad elements with `square` classes and out-of-range ids.
 - Browser lifecycle: in `--headful` mode, the bot leaves the browser open after the game ends (close it manually). Use `--close` to force it to exit.
+- Flag safety: before placing multiple flags, the bot filters them to avoid over-flagging around any revealed number (e.g. never places 2 flags adjacent to a `1`).

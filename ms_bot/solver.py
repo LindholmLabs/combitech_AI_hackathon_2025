@@ -374,12 +374,53 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
 
     to_click -= board.flagged_cells()
     to_flag -= board.flagged_cells()
+    to_flag = filter_flag_moves(board, to_flag)
     return SolveResult(to_click=to_click, to_flag=to_flag, guess=guess, guess_prob=prob)
 
 
 def best_guess(board: BoardSnapshot, total_mines: int) -> tuple[Cell | None, float | None]:
     guess, prob, _safe, _mines = _probability_guess(board, total_mines=total_mines)
     return guess, prob
+
+
+def filter_flag_moves(board: BoardSnapshot, candidates: Iterable[Cell]) -> set[Cell]:
+    """
+    Defensive filter to avoid over-flagging around a revealed number.
+
+    This mainly protects against situations where multiple candidate mines touch a
+    single "1" (or any number), which would immediately contradict the visible
+    constraint and cause a false flag.
+    """
+    nums = board.number_cells()
+    accepted: set[Cell] = set()
+    sim_flags: set[Cell] = set(board.flagged_cells())
+
+    for c in iter_in_order(candidates):
+        if board.get(c) != "covered":
+            continue
+        violates = False
+        # Only check revealed number cells adjacent to the candidate.
+        for n in board.neighbors(c):
+            number = nums.get(n)
+            if number is None:
+                continue
+            flagged_after = 0
+            for nn in board.neighbors(n):
+                if nn == c or nn in sim_flags:
+                    flagged_after += 1
+                else:
+                    v = board.get(nn)
+                    if v == "flagged":
+                        flagged_after += 1
+            if flagged_after > number:
+                violates = True
+                break
+        if violates:
+            continue
+        accepted.add(c)
+        sim_flags.add(c)
+
+    return accepted
 
 
 def choose_first_click(board: BoardSnapshot) -> Cell:
