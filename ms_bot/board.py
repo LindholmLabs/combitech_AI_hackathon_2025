@@ -93,3 +93,37 @@ def parse_square_class(class_name: str) -> object:
     if "bomb" in class_name:
         return "mine"
     return "unknown"
+
+
+def render_board_for_llm(board: BoardSnapshot) -> str:
+    """
+    Render a board snapshot as a compact ASCII grid for debugging.
+
+    Legend:
+      # = covered, F = flagged, M = mine, ? = unknown, 0-8 = open numbers
+    """
+
+    def cell_char(v: object) -> str:
+        if v == "covered":
+            return "#"
+        if v == "flagged":
+            return "F"
+        if v == "mine":
+            return "M"
+        if v == "unknown":
+            return "?"
+        if isinstance(v, int) and 0 <= v <= 8:
+            return str(v)
+        return "?"
+
+    xs = list(range(board.min_x, board.max_x + 1))
+    ys = list(range(board.min_y, board.max_y + 1))
+    header = "    " + " ".join(f"{x:>2}" for x in xs)
+    lines = [
+        f"origin=({board.min_x},{board.min_y}) size={board.width}x{board.height}",
+        header,
+    ]
+    for y in ys:
+        row = [cell_char(board.get(Cell(x, y))) for x in xs]
+        lines.append(f"{y:>3} " + " ".join(f"{c:>2}" for c in row))
+    return "\n".join(lines)

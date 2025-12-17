@@ -241,6 +241,8 @@ def _enumerate_component(
             var_to_cons[vi].append(ci)
 
     assignment = [0] * len(variables)
+    # Heuristic ordering: assign most constrained variables first for better pruning.
+    order = sorted(range(len(variables)), key=lambda vi: len(var_to_cons[vi]), reverse=True)
 
     def feasible() -> bool:
         for ci in range(len(constraints)):
@@ -265,10 +267,11 @@ def _enumerate_component(
                         mines_per_cell[variables[vi]] += 1
             return
 
+        vi = order[i]
         # Try safe then mine to bias towards fewer mines for early pruning.
         for val in (0, 1):
-            assignment[i] = val
-            touched = var_to_cons[i]
+            assignment[vi] = val
+            touched = var_to_cons[vi]
             for ci in touched:
                 cons_remaining[ci] -= 1
                 cons_assigned[ci] += val
@@ -277,7 +280,7 @@ def _enumerate_component(
             for ci in touched:
                 cons_assigned[ci] -= val
                 cons_remaining[ci] += 1
-            assignment[i] = 0
+            assignment[vi] = 0
 
     backtrack(0)
     return total, mines_per_cell
@@ -286,7 +289,7 @@ def _enumerate_component(
 def _probability_guess(
     board: BoardSnapshot,
     total_mines: int,
-    component_limit: int = 18,
+    component_limit: int = 24,
 ) -> tuple[Cell | None, float | None, set[Cell], set[Cell]]:
     covered_all = {c for c in board.iter_cells() if board.get(c) == "covered"}
     flagged = board.flagged_cells()
@@ -298,6 +301,27 @@ def _probability_guess(
 
     probs: dict[Cell, float] = {}
     unconstrained = covered_all - frontier - flagged
+
+    def heuristic_prob_for_frontier_cell(cell: Cell) -> float | None:
+        # Cheap local estimate for cells in large frontier components that we
+        # don't enumerate: look at each adjacent revealed number constraint and
+        # estimate mine chance as (mines_needed / covered_neighbors_count).
+        estimates: list[float] = []
+        for n in board.neighbors(cell):
+            v = board.get(n)
+            if not isinstance(v, int) or v < 0:
+                continue
+            covered, _flagged, flagged_count = _adjacent_sets(board, n)
+            if cell not in covered:
+                continue
+            need = v - flagged_count
+            if need < 0 or len(covered) == 0:
+                continue
+            estimates.append(need / len(covered))
+        if not estimates:
+            return None
+        # Conservative-ish: use the maximum local density among adjacent constraints.
+        return max(estimates)
 
     for variables, cons in _components(frontier, constraints):
         if len(variables) == 0:
@@ -320,8 +344,20 @@ def _probability_guess(
     base_prob = (mines_left / remaining_covered) if remaining_covered else 1.0
     for c in unconstrained:
         probs[c] = base_prob
+    # Frontier cells in skipped components: fill with local heuristic estimate.
+    for c in frontier:
+        if c in flagged or c in probs:
+            continue
+        hp = heuristic_prob_for_frontier_cell(c)
+        if hp is not None:
+            probs[c] = hp
 
-    candidates = [c for c in covered_all if c not in flagged]
+    # If we have any frontier, prefer guessing *on* the frontier instead of
+    # clicking in an unrelated "sea" of covered tiles.
+    if frontier:
+        candidates = [c for c in frontier if c not in flagged and board.get(c) == "covered"]
+    else:
+        candidates = [c for c in covered_all if c not in flagged]
     if not candidates:
         return None, None, safe, mines
 

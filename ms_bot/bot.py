@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
-from .board import BoardSnapshot, Cell, parse_square_class
+from .board import BoardSnapshot, Cell, parse_square_class, render_board_for_llm
 from .solver import best_guess, choose_first_click, iter_in_order, solve_step
 
 
@@ -316,6 +316,14 @@ async def run_bot(
             for line in history:
                 print(line)
             print("---- end history ----")
+        if state == "dead":
+            try:
+                final_board = await read_board(page, width=width, height=height)
+                print("---- final board ----")
+                print(render_board_for_llm(final_board))
+                print("---- end final board ----")
+            except Exception as e:
+                print(f"Failed to dump final board: {e}")
         if leave_open and headful:
             print("Leaving browser open. Close the browser window to exit.")
             # Wait until the user closes the window; Ctrl+C should exit cleanly.
