@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import math
 from typing import Iterable
 
@@ -515,7 +516,23 @@ def _probability_guess(
             return -0.01
         return 0.0
 
-    def score(c: Cell) -> tuple[float, float, int, int]:
+    # Precompute distance-to-nearest-open for tie-breaking efficiently.
+    open_cells = [cc for cc in board.iter_cells() if isinstance(board.get(cc), int)]
+    dist_to_open: dict[Cell, int] = {}
+    if open_cells:
+        q: deque[Cell] = deque()
+        for oc in open_cells:
+            dist_to_open[oc] = 0
+            q.append(oc)
+        while q:
+            cur = q.popleft()
+            nd = dist_to_open[cur] + 1
+            for n in board.neighbors(cur):
+                if n not in dist_to_open:
+                    dist_to_open[n] = nd
+                    q.append(n)
+
+    def score(c: Cell) -> tuple[float, float, int, int, int, int]:
         p = probs.get(c, base_prob)
         # Prefer guesses that are more "connected" to the known area to reduce
         # guess chains: more adjacent revealed numbers, then lower distance to any
@@ -525,15 +542,7 @@ def _probability_guess(
             if isinstance(board.get(n), int):
                 adj_open += 1
 
-        open_cells = getattr(score, "_open_cells", None)
-        if open_cells is None:
-            # Support virtual boards that don't expose a raw `cells` dict.
-            open_cells = [cc for cc in board.iter_cells() if isinstance(board.get(cc), int)]
-            setattr(score, "_open_cells", open_cells)
-        if open_cells:
-            dist = min(abs(c.x - oc.x) + abs(c.y - oc.y) for oc in open_cells)
-        else:
-            dist = 0
+        dist = dist_to_open.get(c, 0)
 
         return (p, p + edge_corner_bonus(c), -adj_open, dist, c.y, c.x)
 
@@ -594,9 +603,10 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
 
     # Propagate deterministic mine flags through the rules, since new flags can
     # unlock new safe clicks (basic rule) without needing to open additional cells.
-    changed = True
-    while changed:
-        changed = False
+    #
+    # Performance: only run the (expensive) probability/enumeration pass when the
+    # cheap local deductions have converged.
+    while True:
         eff = _VirtualBoard(board, virtual_flags)
 
         safe: set[Cell] = set()
@@ -612,7 +622,6 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
         safe |= s
         mines |= m
 
-        # Filter/accept mines safely given already planned flags.
         new_mines = mines - virtual_flags
         if new_mines:
             accepted = filter_flag_moves(board, new_mines, extra_flagged=virtual_flags)
@@ -620,12 +629,13 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
             if accepted:
                 to_flag |= accepted
                 virtual_flags |= accepted
-                changed = True
+                to_click |= safe
+                continue
 
         to_click |= safe
 
-        # Enumeration can also produce forced mines/safes. If it produces new
-        # mines, loop again to unlock more basic deductions.
+        # Now that local deductions are stable, try enumeration to discover
+        # additional forced safes/mines.
         _guess, _prob, enum_safe, enum_mines = _probability_guess(eff, total_mines=total_mines)  # type: ignore[arg-type]
         to_click |= enum_safe
         enum_new = enum_mines - virtual_flags
@@ -635,7 +645,9 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
             if accepted:
                 to_flag |= accepted
                 virtual_flags |= accepted
-                changed = True
+                continue
+
+        break
 
     # After propagation, if there are no deterministic actions, pick a guess.
     guess: Cell | None = None
