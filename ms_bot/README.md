@@ -5,6 +5,8 @@ Run:
 2. Install browsers: `python -m playwright install`
 3. Start (defaults to beginner): `python -m ms_bot.bot --headful`
 4. Other sizes: `python -m ms_bot.bot --intermediate --headful` or `python -m ms_bot.bot --expert --headful`
+5. Multiple runs: `python -m ms_bot.bot --expert --runs 50` (add `--dump-history` / `--dump-board` for per-run dumps)
+6. Run timing: the bot also reads the in-page timer from `seconds_hundreds`, `seconds_tens`, `seconds_ones` and reports per-run and average site time.
 
 Notes:
 - Difficulty presets: `--beginner` (9x9, 10 mines), `--intermediate` (16x16, 40 mines), `--expert` (16x30, 99 mines).
