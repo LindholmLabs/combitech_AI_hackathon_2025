@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Iterable
 
 from .board import BoardSnapshot, Cell
@@ -31,8 +32,7 @@ def _basic_deductions(board: BoardSnapshot) -> tuple[set[Cell], set[Cell]]:
     mines: set[Cell] = set()
 
     for cell, number in board.number_cells().items():
-        if number <= 0:
-            continue
+        # Include 0: if a cell shows 0, all adjacent covered cells are safe.
         covered, flagged, flagged_count = _adjacent_sets(board, cell)
         if not covered:
             continue
@@ -286,6 +286,84 @@ def _enumerate_component(
     return total, mines_per_cell
 
 
+def _enumerate_component_hist(
+    variables: list[Cell],
+    constraints: list[Constraint],
+    max_solutions: int = 200_000,
+) -> tuple[dict[int, int], dict[Cell, dict[int, int]]]:
+    """
+    Enumerate satisfying assignments for a component and return:
+      - counts[m] = number of solutions with exactly m mines in this component
+      - per_cell_counts[cell][m] = number of solutions where cell is a mine AND total mines is m
+    """
+    idx = {c: i for i, c in enumerate(variables)}
+    cons_vars: list[list[int]] = [[idx[c] for c in con.cells if c in idx] for con in constraints]
+    cons_need: list[int] = [con.mines for con in constraints]
+
+    cons_assigned = [0] * len(constraints)
+    cons_remaining = [len(vs) for vs in cons_vars]
+    counts: dict[int, int] = {}
+    per_cell: dict[Cell, dict[int, int]] = {c: {} for c in variables}
+
+    var_to_cons: list[list[int]] = [[] for _ in variables]
+    for ci, vs in enumerate(cons_vars):
+        for vi in vs:
+            var_to_cons[vi].append(ci)
+
+    order = sorted(range(len(variables)), key=lambda vi: len(var_to_cons[vi]), reverse=True)
+    assignment = [0] * len(variables)
+    total = 0
+
+    def feasible() -> bool:
+        for ci in range(len(constraints)):
+            need = cons_need[ci]
+            assigned = cons_assigned[ci]
+            remaining = cons_remaining[ci]
+            if assigned > need:
+                return False
+            if assigned + remaining < need:
+                return False
+        return True
+
+    def backtrack(i: int, mine_count: int) -> None:
+        nonlocal total
+        if total >= max_solutions:
+            return
+        if i == len(variables):
+            if all(cons_assigned[ci] == cons_need[ci] for ci in range(len(constraints))):
+                total += 1
+                counts[mine_count] = counts.get(mine_count, 0) + 1
+                for vi, val in enumerate(assignment):
+                    if val:
+                        cell = variables[vi]
+                        d = per_cell[cell]
+                        d[mine_count] = d.get(mine_count, 0) + 1
+            return
+
+        vi = order[i]
+        for val in (0, 1):
+            assignment[vi] = val
+            touched = var_to_cons[vi]
+            for ci in touched:
+                cons_remaining[ci] -= 1
+                cons_assigned[ci] += val
+            if feasible():
+                backtrack(i + 1, mine_count + val)
+            for ci in touched:
+                cons_assigned[ci] -= val
+                cons_remaining[ci] += 1
+            assignment[vi] = 0
+
+    backtrack(0, 0)
+    return counts, per_cell
+
+
+def _nCk(n: int, k: int) -> int:
+    if k < 0 or k > n:
+        return 0
+    return math.comb(n, k)
+
+
 def _probability_guess(
     board: BoardSnapshot,
     total_mines: int,
@@ -323,21 +401,83 @@ def _probability_guess(
         # Conservative-ish: use the maximum local density among adjacent constraints.
         return max(estimates)
 
+    # Enumerate each connected frontier component (when small enough).
+    enum_components: list[tuple[list[Cell], dict[int, int], dict[Cell, dict[int, int]]]] = []
     for variables, cons in _components(frontier, constraints):
         if len(variables) == 0:
             continue
         if len(variables) > component_limit:
             continue
-        total, mines_per_cell = _enumerate_component(variables, cons)
-        if total == 0:
+        counts, per_cell = _enumerate_component_hist(variables, cons)
+        if sum(counts.values()) == 0:
             continue
-        for c in variables:
-            m = mines_per_cell[c]
-            if m == 0:
-                safe.add(c)
-            elif m == total:
-                mines.add(c)
-            probs[c] = m / total
+        enum_components.append((variables, counts, per_cell))
+
+    # Combine enumerated components with the global mine total to improve guessing.
+    unconstrained_count = len(unconstrained)
+    if enum_components:
+        # dp_all[sum_mines] = number of ways across components to realize that sum.
+        dp_all: dict[int, int] = {0: 1}
+        for _vars, counts, _per_cell in enum_components:
+            new: dict[int, int] = {}
+            for s, ways_s in dp_all.items():
+                for m, ways_m in counts.items():
+                    new[s + m] = new.get(s + m, 0) + ways_s * ways_m
+            dp_all = new
+
+        total_ways = 0
+        for s, ways_s in dp_all.items():
+            total_ways += ways_s * _nCk(unconstrained_count, mines_left - s)
+
+        if total_ways > 0:
+            # Build prefix/suffix DPs so we can compute "other components" efficiently.
+            prefix: list[dict[int, int]] = [{0: 1}]
+            for _vars, counts, _per_cell in enum_components:
+                prev = prefix[-1]
+                cur: dict[int, int] = {}
+                for s, ways_s in prev.items():
+                    for m, ways_m in counts.items():
+                        cur[s + m] = cur.get(s + m, 0) + ways_s * ways_m
+                prefix.append(cur)
+
+            suffix: list[dict[int, int]] = [{0: 1} for _ in range(len(enum_components) + 1)]
+            suffix[-1] = {0: 1}
+            for i in range(len(enum_components) - 1, -1, -1):
+                nxt = suffix[i + 1]
+                counts = enum_components[i][1]
+                cur: dict[int, int] = {}
+                for s, ways_s in nxt.items():
+                    for m, ways_m in counts.items():
+                        cur[s + m] = cur.get(s + m, 0) + ways_s * ways_m
+                suffix[i] = cur
+
+            for i, (_vars, counts_i, per_cell_i) in enumerate(enum_components):
+                # other_dp = convolution(prefix[i], suffix[i+1])
+                other_dp: dict[int, int] = {}
+                for s1, w1 in prefix[i].items():
+                    for s2, w2 in suffix[i + 1].items():
+                        other_dp[s1 + s2] = other_dp.get(s1 + s2, 0) + w1 * w2
+
+                # Precompute weight for each m in this component (ways for the rest + unconstrained).
+                weight_for_m: dict[int, int] = {}
+                for m in counts_i.keys():
+                    w = 0
+                    for s_other, ways_other in other_dp.items():
+                        w += ways_other * _nCk(unconstrained_count, mines_left - (m + s_other))
+                    weight_for_m[m] = w
+
+                for cell, hist in per_cell_i.items():
+                    mine_weight = 0
+                    for m, cnt in hist.items():
+                        mine_weight += cnt * weight_for_m.get(m, 0)
+                    if mine_weight == 0:
+                        safe.add(cell)
+                        probs[cell] = 0.0
+                    elif mine_weight == total_ways:
+                        mines.add(cell)
+                        probs[cell] = 1.0
+                    else:
+                        probs[cell] = mine_weight / total_ways
 
     # Unconstrained cells: simple global estimate.
     remaining_covered = len(covered_all - flagged)
@@ -387,30 +527,109 @@ def solve_step(board: BoardSnapshot, total_mines: int) -> SolveResult:
     to_click: set[Cell] = set()
     to_flag: set[Cell] = set()
 
-    safe, mines = _basic_deductions(board)
-    to_click |= safe
-    to_flag |= mines
+    virtual_flags: set[Cell] = set(board.flagged_cells())
 
-    safe, mines = _subset_deductions(board)
-    to_click |= safe
-    to_flag |= mines
+    class _VirtualBoard:
+        def __init__(self, base: BoardSnapshot, extra_flags: set[Cell]):
+            self._base = base
+            self._extra_flags = extra_flags
+            self.origin_x = base.origin_x
+            self.origin_y = base.origin_y
+            self.width = base.width
+            self.height = base.height
 
-    safe, mines = _pattern_121_1221(board)
-    to_click |= safe
-    to_flag |= mines
+        @property
+        def min_x(self) -> int:
+            return self.origin_x
 
-    guess, prob, enum_safe, enum_mines = _probability_guess(board, total_mines=total_mines)
-    to_click |= enum_safe
-    to_flag |= enum_mines
+        @property
+        def min_y(self) -> int:
+            return self.origin_y
 
-    # Prefer deterministic actions over guessing.
-    if to_click or to_flag:
-        guess = None
-        prob = None
+        @property
+        def max_x(self) -> int:
+            return self.origin_x + self.width - 1
+
+        @property
+        def max_y(self) -> int:
+            return self.origin_y + self.height - 1
+
+        def in_bounds(self, cell: Cell) -> bool:
+            return self._base.in_bounds(cell)
+
+        def neighbors(self, cell: Cell):
+            return self._base.neighbors(cell)
+
+        def iter_cells(self):
+            return self._base.iter_cells()
+
+        def number_cells(self):
+            return self._base.number_cells()
+
+        def flagged_cells(self) -> set[Cell]:
+            return set(self._base.flagged_cells()) | set(self._extra_flags)
+
+        def get(self, cell: Cell) -> object:
+            if cell in self._extra_flags:
+                return "flagged"
+            return self._base.get(cell)
+
+    # Propagate deterministic mine flags through the rules, since new flags can
+    # unlock new safe clicks (basic rule) without needing to open additional cells.
+    changed = True
+    while changed:
+        changed = False
+        eff = _VirtualBoard(board, virtual_flags)
+
+        safe: set[Cell] = set()
+        mines: set[Cell] = set()
+
+        s, m = _basic_deductions(eff)  # type: ignore[arg-type]
+        safe |= s
+        mines |= m
+        s, m = _subset_deductions(eff)  # type: ignore[arg-type]
+        safe |= s
+        mines |= m
+        s, m = _pattern_121_1221(eff)  # type: ignore[arg-type]
+        safe |= s
+        mines |= m
+
+        # Filter/accept mines safely given already planned flags.
+        new_mines = mines - virtual_flags
+        if new_mines:
+            accepted = filter_flag_moves(board, new_mines, extra_flagged=virtual_flags)
+            accepted -= virtual_flags
+            if accepted:
+                to_flag |= accepted
+                virtual_flags |= accepted
+                changed = True
+
+        to_click |= safe
+
+        # Enumeration can also produce forced mines/safes. If it produces new
+        # mines, loop again to unlock more basic deductions.
+        _guess, _prob, enum_safe, enum_mines = _probability_guess(eff, total_mines=total_mines)  # type: ignore[arg-type]
+        to_click |= enum_safe
+        enum_new = enum_mines - virtual_flags
+        if enum_new:
+            accepted = filter_flag_moves(board, enum_new, extra_flagged=virtual_flags)
+            accepted -= virtual_flags
+            if accepted:
+                to_flag |= accepted
+                virtual_flags |= accepted
+                changed = True
+
+    # After propagation, if there are no deterministic actions, pick a guess.
+    guess: Cell | None = None
+    prob: float | None = None
+    if not to_click and not to_flag:
+        eff = _VirtualBoard(board, virtual_flags)
+        guess, prob, _enum_safe, _enum_mines = _probability_guess(eff, total_mines=total_mines)  # type: ignore[arg-type]
 
     to_click -= board.flagged_cells()
     to_flag -= board.flagged_cells()
-    to_flag = filter_flag_moves(board, to_flag)
+    to_click = {c for c in to_click if board.get(c) == "covered"}
+    to_flag = {c for c in to_flag if board.get(c) == "covered"}
     return SolveResult(to_click=to_click, to_flag=to_flag, guess=guess, guess_prob=prob)
 
 
@@ -419,7 +638,11 @@ def best_guess(board: BoardSnapshot, total_mines: int) -> tuple[Cell | None, flo
     return guess, prob
 
 
-def filter_flag_moves(board: BoardSnapshot, candidates: Iterable[Cell]) -> set[Cell]:
+def filter_flag_moves(
+    board: BoardSnapshot,
+    candidates: Iterable[Cell],
+    extra_flagged: set[Cell] | None = None,
+) -> set[Cell]:
     """
     Defensive filter to avoid over-flagging around a revealed number.
 
@@ -430,6 +653,8 @@ def filter_flag_moves(board: BoardSnapshot, candidates: Iterable[Cell]) -> set[C
     nums = board.number_cells()
     accepted: set[Cell] = set()
     sim_flags: set[Cell] = set(board.flagged_cells())
+    if extra_flagged:
+        sim_flags |= set(extra_flagged)
 
     for c in iter_in_order(candidates):
         if board.get(c) != "covered":
