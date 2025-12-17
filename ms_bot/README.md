@@ -21,3 +21,4 @@ Notes:
 - Flag safety: before placing multiple flags, the bot filters them to avoid over-flagging around any revealed number (e.g. never places 2 flags adjacent to a `1`).
 - Performance: within a step, clicks/flags are batched and dispatched in-page (reduces Playwright round-trips); `read_board()` also reads the full board in a single `page.evaluate()` by iterating expected `x_y` ids (no repeated DOM scanning).
 - Guessing: frontier enumeration now weights solutions using the global remaining mine count, so it can find additional forced safe/mine cells and pick better low-risk guesses.
+- Chording: when a number is satisfied by adjacent flags, the bot can middle-click the number to open all remaining neighbors quickly (disable with `--no-chord`).

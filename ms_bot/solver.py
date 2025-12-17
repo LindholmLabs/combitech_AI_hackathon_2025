@@ -517,7 +517,25 @@ def _probability_guess(
 
     def score(c: Cell) -> tuple[float, float, int, int]:
         p = probs.get(c, base_prob)
-        return (p, p + edge_corner_bonus(c), c.y, c.x)
+        # Prefer guesses that are more "connected" to the known area to reduce
+        # guess chains: more adjacent revealed numbers, then lower distance to any
+        # revealed cell. (Frontier already tends to be distance=1.)
+        adj_open = 0
+        for n in board.neighbors(c):
+            if isinstance(board.get(n), int):
+                adj_open += 1
+
+        open_cells = getattr(score, "_open_cells", None)
+        if open_cells is None:
+            # Support virtual boards that don't expose a raw `cells` dict.
+            open_cells = [cc for cc in board.iter_cells() if isinstance(board.get(cc), int)]
+            setattr(score, "_open_cells", open_cells)
+        if open_cells:
+            dist = min(abs(c.x - oc.x) + abs(c.y - oc.y) for oc in open_cells)
+        else:
+            dist = 0
+
+        return (p, p + edge_corner_bonus(c), -adj_open, dist, c.y, c.x)
 
     best = min(candidates, key=score)
     return best, probs.get(best, base_prob), safe, mines

@@ -108,8 +108,9 @@ async def _dispatch_actions(page: "Page", actions: list[dict[str, Any]]) -> int:
             const e = document.getElementById(id);
             if (!e) continue;
             const isRight = buttonName === 'right';
-            const button = isRight ? 2 : 0;
-            const buttons = isRight ? 2 : 1;
+            const isMiddle = buttonName === 'middle';
+            const button = isRight ? 2 : (isMiddle ? 1 : 0);
+            const buttons = isRight ? 2 : (isMiddle ? 4 : 1);
             const common = {
               bubbles: true,
               cancelable: true,
@@ -120,7 +121,8 @@ async def _dispatch_actions(page: "Page", actions: list[dict[str, Any]]) -> int:
             };
             e.dispatchEvent(new MouseEvent('mousedown', common));
             e.dispatchEvent(new MouseEvent('mouseup', common));
-            e.dispatchEvent(new MouseEvent(isRight ? 'contextmenu' : 'click', common));
+            const ev = isRight ? 'contextmenu' : (isMiddle ? 'auxclick' : 'click');
+            e.dispatchEvent(new MouseEvent(ev, common));
             done += 1;
           }
           return done;
@@ -282,6 +284,7 @@ async def play_one_game(
     stuck_threshold: int,
     dump_history: bool,
     dump_board_on_dead: bool,
+    use_chord: bool,
 ) -> tuple[str, int, float, int | None]:
     start = time.perf_counter()
 
@@ -338,6 +341,27 @@ async def play_one_game(
             flags = [c for c in iter_in_order(res.to_flag) if board.get(c) == "covered"]
             clicks = [c for c in iter_in_order(res.to_click) if board.get(c) == "covered"]
 
+            chord_cells: list[Cell] = []
+            if use_chord:
+                planned_flags = set(flags) | {c for c, v in board.cells.items() if v == "flagged"}
+                planned_flags |= set(res.to_flag)
+                click_set = set(clicks)
+                removed: set[Cell] = set()
+                for num_cell, number in board.number_cells().items():
+                    flagged_adj = 0
+                    covered_neighbors: set[Cell] = set()
+                    for n in board.neighbors(num_cell):
+                        if n in planned_flags:
+                            flagged_adj += 1
+                        else:
+                            if board.get(n) == "covered":
+                                covered_neighbors.add(n)
+                    if covered_neighbors and number == flagged_adj:
+                        chord_cells.append(num_cell)
+                        removed |= (covered_neighbors & click_set)
+                if removed:
+                    clicks = [c for c in clicks if c not in removed]
+
             if flags:
                 await _dispatch_actions(
                     page,
@@ -346,11 +370,18 @@ async def play_one_game(
                 for c in flags:
                     history.append(f"{steps:04d} flag {fmt_cell(c)}")
 
-            if clicks:
+            if chord_cells or clicks:
+                actions: list[dict[str, str]] = []
+                for c in chord_cells:
+                    actions.append({"id": f"{c.x}_{c.y}", "button": "middle"})
+                for c in clicks:
+                    actions.append({"id": f"{c.x}_{c.y}", "button": "left"})
                 await _dispatch_actions(
                     page,
-                    [{"id": f"{c.x}_{c.y}", "button": "left"} for c in clicks],
+                    actions,
                 )
+                for c in chord_cells:
+                    history.append(f"{steps:04d} chord {fmt_cell(c)}")
                 for c in clicks:
                     history.append(f"{steps:04d} click {fmt_cell(c)}")
 
@@ -424,6 +455,7 @@ async def run_bot(
     leave_open: bool,
     dump_history: bool,
     dump_board_on_dead: bool,
+    use_chord: bool,
 ) -> None:
     from playwright.async_api import async_playwright
 
@@ -442,8 +474,23 @@ async def run_bot(
             page = await context.new_page()
         page.set_default_timeout(3000)
         page.set_default_navigation_timeout(3000)
+
+        async def _dismiss_dialog(dialog: Any) -> None:
+            try:
+                await dialog.dismiss()
+            except Exception:
+                # Dialog can auto-close/race; ignore.
+                pass
+
+        page.on("dialog", lambda d: asyncio.create_task(_dismiss_dialog(d)))
         await page.add_init_script(
-            "document.addEventListener('contextmenu', e => e.preventDefault());"
+            """
+            document.addEventListener('contextmenu', e => e.preventDefault());
+            // Prevent JS dialogs from interrupting fast event dispatch (or crashing the driver).
+            window.alert = () => {};
+            window.confirm = () => true;
+            window.prompt = () => null;
+            """
         )
         await play_one_game(
             page=page,
@@ -456,6 +503,7 @@ async def run_bot(
             stuck_threshold=stuck_threshold,
             dump_history=dump_history,
             dump_board_on_dead=dump_board_on_dead,
+            use_chord=use_chord,
         )
         if leave_open and headful:
             print("Leaving browser open. Close the browser window to exit.")
@@ -489,6 +537,7 @@ async def run_n_times(
     leave_open: bool,
     dump_history: bool,
     dump_board_on_dead: bool,
+    use_chord: bool,
 ) -> None:
     from playwright.async_api import async_playwright
 
@@ -517,8 +566,21 @@ async def run_n_times(
 
             page.set_default_timeout(3000)
             page.set_default_navigation_timeout(3000)
+
+            async def _dismiss_dialog(dialog: Any) -> None:
+                try:
+                    await dialog.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", lambda d: asyncio.create_task(_dismiss_dialog(d)))
             await page.add_init_script(
-                "document.addEventListener('contextmenu', e => e.preventDefault());"
+                """
+                document.addEventListener('contextmenu', e => e.preventDefault());
+                window.alert = () => {};
+                window.confirm = () => true;
+                window.prompt = () => null;
+                """
             )
 
             print(f"=== Run {i}/{runs} ===")
@@ -533,6 +595,7 @@ async def run_n_times(
                 stuck_threshold=stuck_threshold,
                 dump_history=dump_history,
                 dump_board_on_dead=dump_board_on_dead,
+                use_chord=use_chord,
             )
             durations.append(elapsed)
             site_seconds.append(website_seconds)
@@ -584,6 +647,11 @@ def main() -> None:
     ap.add_argument("--slowmo-ms", type=int, default=0)
     ap.add_argument("--think-ms", type=int, default=30)
     ap.add_argument("--max-steps", type=int, default=5000)
+    ap.add_argument(
+        "--no-chord",
+        action="store_true",
+        help="Disable chord/middle-click opening around satisfied numbers.",
+    )
     ap.add_argument("--runs", type=int, default=1, help="Play N games back-to-back.")
     ap.add_argument(
         "--dump-history",
@@ -643,6 +711,7 @@ def main() -> None:
                     leave_open=False,
                     dump_history=bool(args.dump_history),
                     dump_board_on_dead=bool(args.dump_board),
+                    use_chord=not bool(args.no_chord),
                 )
             )
         else:
@@ -661,6 +730,7 @@ def main() -> None:
                     stuck_threshold=args.stuck_threshold,
                     dump_history=True,
                     dump_board_on_dead=True,
+                    use_chord=not bool(args.no_chord),
                 )
             )
     except KeyboardInterrupt:
